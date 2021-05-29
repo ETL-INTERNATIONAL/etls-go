@@ -1,0 +1,79 @@
+run:
+  concurrency: 4
+  deadline: 1m
+  issues-exit-code: 1
+  modules-download-mode: vendor
+  tests: true
+  skip-dirs:
+    - static
+    - vendor
+  skip-files:
+    - bindata.go
+    - .*_mock.go
+    - contracts/
+    - eth-node/crypto/ecies/ # copied
+    - eth-node/keystore/ # copied
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+linters-settings:
+  errcheck:
+    check-type-assertions: false
+    check-blank: false
+  govet:
+    check-shadowing: false
+  golint:
+    min-confidence: 0.8
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes: github.com/ethereum/go-ethereum,github.com/status-im/status-go
+  maligned:
+    suggest-new: true
+  dupl:
+    threshold: 50
+  goconst:
+    min-len: 3
+    min-occurrences: 2
+
+linters:
+  disable-all: true
+  enable:
+    - deadcode
+    - errcheck
+    - gosec
+    - goconst
+    - goimports
+    - golint
+    - govet
+    - ineffassign
+    - megacheck
+    - misspell
+    - structcheck
+#    - typecheck
+    - unconvert
+    - varcheck
+  fast: false
+
+issues:
+  exclude:
+    - "composite literal uses unkeyed fields" # govet
+    - "G304: Potential file inclusion via variable" # gosec
+    - "G104: Errors unhandled." #gosec
+    - "lib._Ctype_char, which can be annoying to use" # golint
+  exclude-rules:
+    - path: eth-node/keystore/passphrase\.go
+      text: "make it a constant"
+      linters:
+        - goconst
+    - path: protocol/message_handler\.go
+      text: "make it a constant"
+      linters:
+        - goconst
+    - path: protocol/.*_test\.go
+      text: "make it a constant"
+      linters:
+        - goconst

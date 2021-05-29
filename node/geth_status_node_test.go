@@ -1,0 +1,297 @@
+package node
+
+import (
+	"fmt"
+	"io/ioutil"
+	"math"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum/les"
+	gethnode "github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/p2p"
+
+	"github.com/status-im/status-go/waku"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/status-im/status-go/discovery"
+	"github.com/status-im/status-go/params"
+	"github.com/status-im/status-go/t/helpers"
+	"github.com/status-im/status-go/t/utils"
+)
+
+func TestStatusNodeStart(t *testing.T) {
+	config, err := utils.MakeTestNodeConfigWithDataDir("", "", params.StatusChainNetworkID)
+	require.NoError(t, err)
+	n := New()
+
+	// checks before node is started
+	require.Nil(t, n.GethNode())
+	require.Nil(t, n.Config())
+	require.Nil(t, n.RPCClient())
+	require.Equal(t, 0, n.PeerCount())
+	// start node
+	require.NoError(t, n.Start(config, nil))
+
+	// checks after node is started
+	require.True(t, n.IsRunning())
+	require.NotNil(t, n.GethNode())
+	require.NotNil(t, n.Config())
+	require.NotNil(t, n.RPCClient())
+	require.Equal(t, 0, n.PeerCount())
+	accountManager, err := n.AccountManager()
+	require.Nil(t, err)
+	require.NotNil(t, accountManager)
+	// try to start already started node
+	require.EqualError(t, n.Start(config, nil), ErrNodeRunning.Error())
+
+	// stop node
+	require.NoError(t, n.Stop())
+	// try to stop already stopped node
+	require.EqualError(t, n.Stop(), ErrNoRunningNode.Error())
+
+	// checks after node is stopped
+	require.Nil(t, n.GethNode())
+	require.Nil(t, n.RPCClient())
+	require.Equal(t, 0, n.PeerCount())
+}
+
+func TestStatusNodeWithDataDir(t *testing.T) {
+	var err error
+
+	dir, err := ioutil.TempDir("", "status-node-test")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, os.RemoveAll(dir))
+	}()
+
+	// keystore directory
+	keyStoreDir := path.Join(dir, "keystore")
+	err = os.MkdirAll(keyStoreDir, os.ModePerm)
+	require.NoError(t, err)
+
+	config := params.NodeConfig{
+		DataDir:     dir,
+		KeyStoreDir: keyStoreDir,
+	}
+	n := New()
+
+	require.NoError(t, n.Start(&config, nil))
+	require.NoError(t, n.Stop())
+}
+
+func TestStatusNodeServiceGetters(t *testing.T) {
+	config := params.NodeConfig{
+		EnableNTPSync: true,
+		WakuConfig: params.WakuConfig{
+			Enabled: true,
+		},
+		LightEthConfig: params.LightEthConfig{
+			Enabled: true,
+		},
+	}
+	n := New()
+
+	var (
+		instance interface{}
+		err      error
+	)
+
+	services := []struct {
+		getter func() (interface{}, error)
+		typ    reflect.Type
+	}{
+		{
+			getter: func() (interface{}, error) {
+				return n.WakuService()
+			},
+			typ: reflect.TypeOf(&waku.Waku{}),
+		},
+		{
+			getter: func() (interface{}, error) {
+				return n.LightEthereumService()
+			},
+			typ: reflect.TypeOf(&les.LightEthereum{}),
+		},
+	}
+
+	for _, service := range services {
+		t.Run(service.typ.String(), func(t *testing.T) {
+			// checks before node is started
+			instance, err = service.getter()
+			require.EqualError(t, err, ErrNoRunningNode.Error())
+			require.Nil(t, instance)
+
+			// start node
+			require.NoError(t, n.Start(&config, nil))
+
+			// checks after node is started
+			instance, err = service.getter()
+			require.NoError(t, err)
+			require.NotNil(t, instance)
+			require.Equal(t, service.typ, reflect.TypeOf(instance))
+
+			// stop node
+			require.NoError(t, n.Stop())
+
+			// checks after node is stopped
+			instance, err = service.getter()
+			require.EqualError(t, err, ErrNoRunningNode.Error())
+			require.Nil(t, instance)
+		})
+	}
+}
+
+func TestStatusNodeAddPeer(t *testing.T) {
+	var err error
+
+	peer, err := gethnode.New(&gethnode.Config{
+		P2P: p2p.Config{
+			MaxPeers:    math.MaxInt32,
+			NoDiscovery: true,
+			ListenAddr:  ":0",
+		},
+		NoUSB: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, peer.Start())
+	defer func() { require.NoError(t, peer.Stop()) }()
+	peerURL := peer.Server().Self().URLv4()
+
+	n := New()
+
+	// checks before node is started
+	require.EqualError(t, n.AddPeer(peerURL), ErrNoRunningNode.Error())
+
+	// start status node
+	config := params.NodeConfig{
+		MaxPeers: math.MaxInt32,
+	}
+	require.NoError(t, n.Start(&config, nil))
+	defer func() { require.NoError(t, n.Stop()) }()
+
+	errCh := helpers.WaitForPeerAsync(n.Server(), peerURL, p2p.PeerEventTypeAdd, time.Second*5)
+
+	// checks after node is started
+	require.NoError(t, n.AddPeer(peerURL))
+	require.NoError(t, <-errCh)
+	require.Equal(t, 1, n.PeerCount())
+}
+
+func TestStatusNodeRendezvousDiscovery(t *testing.T) {
+	config := params.NodeConfig{
+		Rendezvous:  true,
+		NoDiscovery: true,
+		ClusterConfig: params.ClusterConfig{
+			Enabled: true,
+			// not necessarily with id, just valid multiaddr
+			RendezvousNodes: []string{"/ip4/127.0.0.1/tcp/34012", "/ip4/127.0.0.1/tcp/34011"},
+		},
+		// use custom address to test the all possibilities
+		AdvertiseAddr: "127.0.0.1",
+	}
+	n := New()
+	require.NoError(t, n.Start(&config, nil))
+	require.NotNil(t, n.discovery)
+	require.True(t, n.discovery.Running())
+	require.IsType(t, &discovery.Rendezvous{}, n.discovery)
+}
+
+func TestStatusNodeStartDiscoveryManual(t *testing.T) {
+	config := params.NodeConfig{
+		Rendezvous:  true,
+		NoDiscovery: true,
+		ClusterConfig: params.ClusterConfig{
+			Enabled: true,
+			// not necessarily with id, just valid multiaddr
+			RendezvousNodes: []string{"/ip4/127.0.0.1/tcp/34012", "/ip4/127.0.0.1/tcp/34011"},
+		},
+		// use custom address to test the all possibilities
+		AdvertiseAddr: "127.0.0.1",
+	}
+	n := New()
+	require.NoError(t, n.StartWithOptions(&config, StartOptions{}))
+	require.Nil(t, n.discovery)
+	// start discovery manually
+	require.NoError(t, n.StartDiscovery())
+	require.NotNil(t, n.discovery)
+	require.True(t, n.discovery.Running())
+	require.IsType(t, &discovery.Rendezvous{}, n.discovery)
+}
+
+func TestStatusNodeDiscoverNode(t *testing.T) {
+	config := params.NodeConfig{
+		NoDiscovery: true,
+		ListenAddr:  "127.0.0.1:0",
+	}
+	n := New()
+	require.NoError(t, n.Start(&config, nil))
+	node, err := n.discoverNode()
+	require.NoError(t, err)
+	require.Equal(t, net.ParseIP("127.0.0.1").To4(), node.IP())
+
+	config = params.NodeConfig{
+		NoDiscovery:   true,
+		AdvertiseAddr: "127.0.0.2",
+		ListenAddr:    "127.0.0.1:0",
+	}
+	n = New()
+	require.NoError(t, n.Start(&config, nil))
+	node, err = n.discoverNode()
+	require.NoError(t, err)
+	require.Equal(t, net.ParseIP("127.0.0.2").To4(), node.IP())
+}
+
+func TestChaosModeCheckRPCClientsUpstreamURL(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `{
+			"id": 1,
+			"jsonrpc": "2.0",
+			"result": 1
+		}`)
+	}))
+	defer ts.Close()
+
+	config := params.NodeConfig{
+		NoDiscovery: true,
+		ListenAddr:  "127.0.0.1:0",
+		UpstreamConfig: params.UpstreamRPCConfig{
+			Enabled: true,
+			// put "infura.io" substring to simulate blocking an actual infura.io URLs
+			URL: ts.URL + "?actualURL=infura.io",
+		},
+	}
+	n := New()
+	require.NoError(t, n.Start(&config, nil))
+	defer func() { require.NoError(t, n.Stop()) }()
+	require.NotNil(t, n.RPCClient())
+
+	client := n.RPCClient()
+	require.NotNil(t, client)
+
+	err := client.Call(nil, "net_version")
+	require.NoError(t, err)
+
+	// act
+	err = n.ChaosModeCheckRPCClientsUpstreamURL(true)
+	require.NoError(t, err)
+
+	// assert
+	err = client.Call(nil, "net_version")
+	require.Error(t, err)
+
+	// act
+	err = n.ChaosModeCheckRPCClientsUpstreamURL(false)
+	require.NoError(t, err)
+
+	// assert
+	err = client.Call(nil, "net_version")
+	require.NoError(t, err)
+}

@@ -1,0 +1,74 @@
+library 'status-jenkins-lib@v1.2.17'
+
+pipeline {
+  agent { label 'linux' }
+
+  parameters {
+    string(
+      name: 'BRANCH',
+      defaultValue: 'develop',
+      description: 'Name of branch to build.'
+    )
+    booleanParam(
+      name: 'RELEASE',
+      defaultValue: false,
+      description: 'Enable to create build for release.',
+    )
+  }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    /* Go requires a certain directory structure */
+    checkoutToSubdirectory('src/github.com/status-im/status-go')
+    /* manage how many builds we keep */
+    buildDiscarder(logRotator(
+      numToKeepStr: '5',
+      daysToKeepStr: '30',
+    ))
+  }
+
+  environment {
+    TARGET      = "docker"
+    GOPATH      = "${env.WORKSPACE}"
+    STATUS_PATH = "${env.WORKSPACE}/src/github.com/status-im/status-go"
+    PATH        = "/usr/local/go/bin:${env.PATH}:${env.GOPATH}/bin"
+    /* docker image settings */
+    IMAGE_NAME  = "statusteam/status-go"
+    IMAGE_TAG   = "deploy-test"
+  }
+
+  stages {
+    stage('Prep') { steps { dir(env.STATUS_PATH) { script {
+      println("Version:    ${utils.getVersion()}")
+      println("Git Branch: ${utils.branchName()}")
+      println("Git Commit: ${utils.gitCommit()}")
+    } } } }
+
+    stage('Build') { steps { dir(env.STATUS_PATH) { script {
+      sh 'make docker-image'
+      image = docker.image("${env.IMAGE_NAME}:v${utils.getVersion()}")
+    } } } }
+
+    stage('Push') { steps { dir(env.STATUS_PATH) { script {
+      withDockerRegistry([credentialsId: "dockerhub-statusteam-auto", url: ""]) {
+        image.push()
+      }
+    } } } }
+
+    stage('Deploy') {
+      when { expression { params.RELEASE == true } }
+      steps { dir(env.STATUS_PATH) { script {
+        withDockerRegistry([credentialsId: "dockerhub-statusteam-auto", url: ""]) {
+          image.push(env.IMAGE_TAG)
+        }
+    } } } }
+  } // stages
+  post {
+    success { script { github.notifyPR(true) } }
+    failure { script { github.notifyPR(false) } }
+    always  { dir(env.STATUS_PATH) {
+      sh 'make clean-docker-images'
+    } }
+  } // post
+} // pipeline

@@ -1,0 +1,76 @@
+library 'status-jenkins-lib@v1.2.17'
+
+pipeline {
+  agent { label 'macos' }
+
+  parameters {
+    string(
+      name: 'BRANCH',
+      defaultValue: 'develop',
+      description: 'Name of branch to build.'
+    )
+    booleanParam(
+      name: 'RELEASE',
+      defaultValue: false,
+      description: 'Enable to create build for release.',
+    )
+  }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    /* Go requires a certain directory structure */
+    checkoutToSubdirectory('src/github.com/status-im/status-go')
+    /* manage how many builds we keep */
+    buildDiscarder(logRotator(
+      numToKeepStr: '5',
+      daysToKeepStr: '30',
+    ))
+  }
+
+  environment {
+    /* fix for gomobile complaining about missing packages */
+    CGO_ENABLED = "1"
+    GO111MODULE = "off"
+    /* Other stuff */
+    TARGET      = 'ios'
+    GOPATH      = "${env.WORKSPACE}"
+    STATUS_PATH = "${env.WORKSPACE}/src/github.com/status-im/status-go"
+    ARTIFACT    = "${env.WORKSPACE}/status-go-ios-${utils.timestamp()}-${utils.gitCommit()}.zip"
+    PATH        = "/usr/local/go/bin:${env.PATH}:${env.GOPATH}/bin"
+  }
+
+  stages {
+    stage('Prep') { steps { dir(env.STATUS_PATH) { script {
+      println("Version:    ${utils.getVersion()}")
+      println("Git Branch: ${utils.branchName()}")
+      println("Git Commit: ${utils.gitCommit()}")
+    } } } }
+
+    stage('Setup') { steps { dir(env.STATUS_PATH) {
+      sh 'unset TMPDIR && make setup-build'
+    } } }
+
+    stage('Compile') { steps { dir(env.STATUS_PATH) {
+      sh 'make statusgo-ios'
+      sh 'go get golang.org/x/tools/go/packages'
+      dir('build/bin') {
+        sh 'zip -r status-go-ios.zip Statusgo.framework'
+        sh "cp status-go-ios.zip ${env.ARTIFACT}"
+      }
+    } } }
+
+    stage('Archive') { steps {
+      archiveArtifacts(env.ARTIFACT.minus("${env.WORKSPACE}/"))
+    } }
+
+    stage('Upload') { steps { script {
+      env.PKG_URL = s3.uploadArtifact(env.ARTIFACT)
+    } } }
+  } // stages
+  post {
+    success { script { github.notifyPR(true) } }
+    failure { script { github.notifyPR(false) } }
+    always { dir(env.STATUS_PATH) { sh 'make clean' } }
+  } // post
+} // pipeline
